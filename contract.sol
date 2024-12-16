@@ -8,13 +8,11 @@ contract SelfHelp {
         string shgDescription;
         uint256 timeOfCreation;
         uint256 balance;
-        mapping(address => uint256) funderDetails;
-        uint256 numberOfFunders;
-        address[] funders;
+        mapping(address => bool) funders;
         uint256 votingDuration;
     }
 
-    enum ProposalStatus { Pending, Approved, Rejected }
+    enum ProposalStatus { Pending, Approved, Rejected, Expired }
 
     struct Proposal {
         uint256 shgId;
@@ -26,20 +24,24 @@ contract SelfHelp {
         uint256 votesAgainst;
         uint256 timeOfProposal;
         ProposalStatus status;
-        mapping(address => bool) votersInFavour;
-        mapping(address => bool) votersAgainst;
     }
 
     uint256 public shgId = 0;
     uint256 public proposalId = 0;
 
     mapping(uint256 => SHG) public shgDetails;
+    mapping(uint256 => Proposal) public proposalDetails;
+    mapping(uint256 => address[]) public members;
     mapping(address => uint256[]) public memberOfShg;
     mapping(uint256 => uint256[]) public proposalIdInShg;
-    mapping(uint256 => Proposal) public proposalDetails;
 
     modifier onlySHGMember(uint256 _shgId) {
-        require(shgDetails[_shgId].funderDetails[msg.sender] > 0, "Not a member of this SHG");
+        require(shgDetails[_shgId].funders[msg.sender], "Not a member of this SHG");
+        _;
+    }
+
+    modifier onlySHGAdmin(uint256 _shgId) {
+        require(msg.sender == shgDetails[_shgId].admin, "Only SHG admin can perform this action");
         _;
     }
 
@@ -52,40 +54,33 @@ contract SelfHelp {
 
     function addSHG(string memory _shgName, string memory _shgDescription, uint256 _votingDuration) public {
         shgId++;
-        SHG storage shg = shgDetails[shgId];
-        shg.admin = msg.sender;
-        shg.shgName = _shgName;
-        shg.shgDescription = _shgDescription;
-        shg.timeOfCreation = block.timestamp;
-        shg.balance = 0;
-        shg.votingDuration = _votingDuration*3600;
+        require(memberOfShg[msg.sender].length == 0, "You can only create one SHG");
+        
+        SHG storage newShg = shgDetails[shgId];
+        newShg.admin = msg.sender;
+        newShg.shgName = _shgName;
+        newShg.shgDescription = _shgDescription;
+        newShg.timeOfCreation = block.timestamp;
+        newShg.balance = 0;
+        newShg.votingDuration = _votingDuration * 1 hours;
 
+        memberOfShg[msg.sender].push(shgId);
+        members[shgId].push(msg.sender);
+        
         emit SHGCreated(shgId, msg.sender, _shgName);
     }
 
     function addFunds(uint256 _shgId) public payable {
-        SHG storage shg = shgDetails[_shgId];
         require(msg.value > 0, "Must send funds");
-
-        if (shg.funderDetails[msg.sender] == 0) {
-            shg.funders.push(msg.sender);
-            shg.numberOfFunders++;
-
-            bool alreadyMember = false;
-            for (uint256 i = 0; i < memberOfShg[msg.sender].length; i++) {
-                if (memberOfShg[msg.sender][i] == _shgId) {
-                    alreadyMember = true;
-                    break;
-                }
-            }
-            if (!alreadyMember) {
-                memberOfShg[msg.sender].push(_shgId);
-            }
+        SHG storage shg = shgDetails[_shgId];
+        
+        if (!shg.funders[msg.sender]) {
+            shg.funders[msg.sender] = true;
+            members[_shgId].push(msg.sender);
+            memberOfShg[msg.sender].push(_shgId);
         }
 
-        shg.funderDetails[msg.sender] += msg.value;
         shg.balance += msg.value;
-
         emit FundsAdded(_shgId, msg.sender, msg.value);
     }
 
@@ -112,38 +107,20 @@ contract SelfHelp {
         emit ProposalCreated(proposalId, _shgId, msg.sender, _proposalName);
     }
 
-    function voteInFavour(uint256 _proposalId) public {
+    function vote(uint256 _proposalId, bool _inFavour) public {
         Proposal storage prop = proposalDetails[_proposalId];
         SHG storage shg = shgDetails[prop.shgId];
-        require(shg.funderDetails[msg.sender] > 0, "Not a member of this SHG");
+        require(shg.funders[msg.sender], "Not a member of this SHG");
         require(block.timestamp <= prop.timeOfProposal + shg.votingDuration, "Voting period has ended");
         require(msg.sender != prop.proposer, "Proposer cannot vote");
-        require(
-            !prop.votersInFavour[msg.sender] && !prop.votersAgainst[msg.sender],
-            "You have already voted"
-        );
 
-        prop.votersInFavour[msg.sender] = true;
-        prop.votesInFavour++;
+        if (_inFavour) {
+            prop.votesInFavour++;
+        } else {
+            prop.votesAgainst++;
+        }
 
-        emit Voted(_proposalId, msg.sender, true);
-    }
-
-    function voteAgainst(uint256 _proposalId) public {
-        Proposal storage prop = proposalDetails[_proposalId];
-        SHG storage shg = shgDetails[prop.shgId];
-        require(shg.funderDetails[msg.sender] > 0, "Not a member of this SHG");
-        require(block.timestamp <= prop.timeOfProposal + shg.votingDuration, "Voting period has ended");
-        require(msg.sender != prop.proposer, "Proposer cannot vote");
-        require(
-            !prop.votersInFavour[msg.sender] && !prop.votersAgainst[msg.sender],
-            "You have already voted"
-        );
-
-        prop.votersAgainst[msg.sender] = true;
-        prop.votesAgainst++;
-
-        emit Voted(_proposalId, msg.sender, false);
+        emit Voted(_proposalId, msg.sender, _inFavour);
     }
 
     function finalizeProposal(uint256 _proposalId) public {
@@ -152,8 +129,13 @@ contract SelfHelp {
         require(block.timestamp > prop.timeOfProposal + shg.votingDuration, "Voting still in progress");
         require(prop.status == ProposalStatus.Pending, "Proposal already finalized");
 
-        if (prop.votesInFavour > prop.votesAgainst) {
+        uint256 totalMembers = members[prop.shgId].length;
+        uint256 requiredVotes = (totalMembers * 50) / 100; // Minimum 50% of members must vote
+
+        if (prop.votesInFavour > prop.votesAgainst && (prop.votesInFavour + prop.votesAgainst) >= requiredVotes) {
             prop.status = ProposalStatus.Approved;
+        } else if ((prop.votesInFavour + prop.votesAgainst) < requiredVotes) {
+            prop.status = ProposalStatus.Expired;
         } else {
             prop.status = ProposalStatus.Rejected;
         }
@@ -172,23 +154,8 @@ contract SelfHelp {
         uint256 amountToTransfer = prop.amount;
         prop.amount = 0;
         shg.balance -= amountToTransfer;
-
-        (bool success, ) = payable(msg.sender).call{value: amountToTransfer}("");
-        require(success, "Transfer failed");
+        payable(msg.sender).transfer(amountToTransfer);
 
         emit FundsClaimed(_shgId, _proposalId, msg.sender, amountToTransfer);
-    }
-
-    function getFunderDetails(uint256 _shgId, address _funder) public view returns (uint256) {
-        return shgDetails[_shgId].funderDetails[_funder];
-    }
-
-    function getProposalVoterDetails(uint256 _proposalId, address _voter)
-        public
-        view
-        returns (bool inFavour, bool against)
-    {
-        Proposal storage prop = proposalDetails[_proposalId];
-        return (prop.votersInFavour[_voter], prop.votersAgainst[_voter]);
     }
 }
